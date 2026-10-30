@@ -1,0 +1,642 @@
+---
+title: CREATE TYPE
+description: Define a custom type with encoding, decoding, validation, and defaults for use in STRICT tables
+sidebarTitle: CREATE TYPE
+---
+
+# CREATE TYPE
+
+<Info>
+**Turso Extension**: CREATE TYPE is a Turso-specific statement not available in standard SQLite. Custom types require STRICT tables. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+The CREATE TYPE statement defines a user-defined type that controls how values are encoded before storage, decoded when read, validated on input, compared for ordering, and what default value to use. Custom types extend the STRICT table type system beyond the five built-in SQLite storage classes.
+
+## Syntax
+
+```sql
+CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
+    BASE base-type
+    [ENCODE encode-expr]
+    [COERCE coerce-expr]
+    [DECODE decode-expr]
+    [OPERATOR '<']
+    [DEFAULT default-expr];
+```
+
+## Description
+
+A custom type wraps one of the four base storage types with user-defined logic. When a value is written to a column of a custom type, the ENCODE expression transforms it before storage. When a value is read, the DECODE expression transforms it back. This lets you store data in an efficient on-disk representation while presenting a different form to queries.
+
+Custom types work only with STRICT tables. Using a custom type name in a non-STRICT table has no effect.
+
+## Clauses
+
+### IF NOT EXISTS
+
+Suppresses the error that would occur if a type with the same name already exists. The existing type is left unchanged.
+
+```sql
+CREATE TYPE IF NOT EXISTS cents BASE integer ENCODE value * 100 DECODE value / 100;
+```
+
+### BASE
+
+Specifies the underlying SQLite storage class used to store values on disk. Every custom type must have a BASE clause.
+
+| Base Type | Description |
+|-----------|-------------|
+| `integer` | Signed integer, stored in 1-8 bytes depending on magnitude |
+| `real` | 8-byte IEEE 754 floating-point number |
+| `text` | UTF-8 encoded string |
+| `blob` | Raw binary data |
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+```
+
+### ENCODE / DECODE
+
+The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
+
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
+- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
+- **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
+
+```sql
+-- Store text in reversed form
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value);
+```
+
+The ENCODE expression is the place to put validation logic. If the ENCODE expression raises an error, the INSERT or UPDATE is aborted.
+
+### Parameters
+
+Custom types can accept parameters. Parameters are declared as a parenthesized list after the type name. Each parameter has a name and an optional type annotation. Only the COERCE expression can use them; an ENCODE or DECODE that names a parameter fails with `ENCODE cannot use type parameter "maxlen": only COERCE can`.
+
+```sql
+CREATE TYPE varchar(value text, maxlen integer) BASE text
+    COERCE CASE
+        WHEN length(value) <= maxlen THEN value
+        ELSE RAISE(ABORT, 'value too long for varchar')
+    END
+    DECODE value;
+```
+
+When a column uses a parametric type, the arguments are supplied in parentheses after the type name:
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name varchar(100),
+    bio varchar(500)
+) STRICT;
+```
+
+The first parameter is always the input `value`. Additional parameters are the arguments provided in the column type declaration, in order.
+
+### COERCE
+
+The COERCE expression fits an already encoded value to what the column may store, such as the maximum length of a `varchar(100)`, the scale of a `numeric(10,2)` or the range of a `smallint`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. Put limit checks in COERCE, not ENCODE: ENCODE also runs on values that are only compared, so a range check there would make `smallint_col < 100000` fail.
+
+- **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. For a type without parameters it also runs on `CAST(x AS t)`. `CAST(x AS t)` on a type with parameters is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
+- **When it does not run**: on a column of a type with parameters declared without arguments (`name varchar`), on NULL values, and on constants compared with a column. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false, because `3.504` is encoded but not rounded. An index lookup uses the same rule, so it finds the same rows as a table scan.
+- **DECODE** never sees the parameters.
+
+```sql
+CREATE TYPE capped(value integer, maxval integer) BASE integer
+    COERCE CASE
+        WHEN value <= maxval THEN value
+        ELSE RAISE(ABORT, 'value above maximum for capped')
+    END;
+
+CREATE TABLE t(x capped(10)) STRICT;
+INSERT INTO t VALUES (11);
+-- Runtime error: value above maximum for capped
+SELECT CAST(11 AS capped);      -- 11
+SELECT CAST(11 AS capped(10));  -- Runtime error: value above maximum for capped
+```
+
+The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` turns the input into a decimal, and `COERCE numeric_fit(value, precision, scale)` rounds it to `scale` decimal places and rejects it if it has more than `precision` digits.
+
+### Sorting and comparing
+
+ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
+
+```sql
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value)
+    OPERATOR '<';
+CREATE TABLE t(w reversed_text) STRICT;
+INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
+SELECT w FROM t ORDER BY w;
+-- banana   (stored as 'ananab')
+-- apple    (stored as 'elppa')
+-- cherry   (stored as 'yrrehc')
+```
+
+The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
+
+### Arithmetic
+
+A user-defined type has no arithmetic operators. `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>`, unary `-` and `~` on a value of the type fail with `operator does not exist`:
+
+```sql
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TABLE t(c cents) STRICT;
+SELECT c + 1 FROM t;
+-- Parse error: operator does not exist: cents + integer
+```
+
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The operator is chosen once, when the statement is compiled:
+
+- If either operand has a custom type and no operator of the type fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's operator.
+- If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
+- A domain uses the operators of its base type.
+- A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
+
+### OPERATOR '<'
+
+`OPERATOR '<'`, with no function, says that the type can be sorted by its stored value (see [Sorting and comparing](#sorting-and-comparing)). It takes no function: `OPERATOR '<' f` fails with `OPERATOR '<' takes no function: a type that declares it sorts by its stored value`. It is the only OPERATOR clause CREATE TYPE accepts: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`, and so do the other operators.
+
+### DEFAULT
+
+The DEFAULT clause sets a type-level default value. When a column of this type does not specify its own DEFAULT, this value is used.
+
+```sql
+CREATE TYPE boolean BASE integer
+    ENCODE boolean_to_int(value)
+    DECODE CASE WHEN value THEN 1 ELSE 0 END
+    OPERATOR '<'
+    DEFAULT 0;
+```
+
+A column-level DEFAULT overrides the type-level DEFAULT:
+
+```sql
+CREATE TABLE flags (
+    id INTEGER PRIMARY KEY,
+    is_active boolean,              -- uses type default (0)
+    is_admin boolean DEFAULT 1      -- overrides type default
+) STRICT;
+```
+
+## Validation with RAISE
+
+Use CASE/WHEN with RAISE in the ENCODE expression to validate input at write time. If the condition fails, the statement is aborted with the specified error message.
+
+```sql
+CREATE TYPE positive_int BASE integer
+    ENCODE CASE
+        WHEN value > 0 THEN value
+        ELSE RAISE(ABORT, 'value must be positive')
+    END
+    DECODE value;
+```
+
+```sql
+CREATE TYPE email BASE text
+    ENCODE CASE
+        WHEN value LIKE '%_@_%.__%' THEN lower(value)
+        ELSE RAISE(ABORT, 'invalid email address')
+    END
+    DECODE value;
+```
+
+## CAST Support
+
+The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+SELECT CAST(42.5 AS cents);
+-- 4250
+```
+
+This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+
+## CHECK Constraints with Custom Types
+
+In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    price cents CHECK(price >= CAST(0 AS cents))
+) STRICT;
+```
+
+## Inspecting Types
+
+### PRAGMA list_types
+
+Lists all available types, including built-in and user-defined. The columns are `type`, `parent`, `encode`, `coerce`, `decode`, `default` and `operators`:
+
+```sql
+PRAGMA list_types;
+-- type                                                 | parent | encode                | coerce                                 | ...
+-- numeric(value any, precision integer, scale integer) | blob   | numeric_encode(value) | numeric_fit(value, precision, scale)   | ...
+-- varchar(value text, maxlen integer)                  | text   |                       | CASE WHEN length(value) <= maxlen ...  | ...
+-- ...
+```
+
+### sqlite_turso_types Virtual Table
+
+The `sqlite_turso_types` virtual table provides the name and SQL definition of each type:
+
+```sql
+SELECT name, sql FROM sqlite_turso_types;
+-- name    | sql
+-- boolean | CREATE TYPE boolean(value any) BASE integer ENCODE ...
+-- ...
+```
+
+## Using with ALTER TABLE
+
+Custom types can be used when adding columns with ALTER TABLE ADD COLUMN:
+
+```sql
+ALTER TABLE users ADD COLUMN email varchar(255);
+```
+
+The added column follows the same STRICT type-checking rules as columns defined in the original CREATE TABLE.
+
+## Built-in Types
+
+Turso provides the following built-in custom types in STRICT tables:
+
+| Type | Base | Parameters | Description |
+|------|------|------------|-------------|
+| `boolean` | integer | -- | Constrained to 0 or 1. Aliases: `bool`. |
+| `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
+| `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
+| `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. In `date - x`, a value `x` of unknown type, such as a parameter, is taken as a number of days, and anything other than an integer fails when the statement runs. `x - date` fails with `operator does not exist`; cast `x` to `date` first. |
+| `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
+| `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
+| `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * / %` with another numeric, an integer (also a `smallint` or `bigint`) or a decimal number written in the statement compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. A decimal number stays exact inside a subquery, CTE, `coalesce`, `abs` or CASE: `n + (SELECT 0.2)` is a numeric. Arithmetic on two plain values, such as `0.1 + 0.2`, is a REAL, as SQLite computes it. With a REAL value (a REAL column, a CAST to REAL), `+ - * /` give a REAL, as PostgreSQL gives double precision, and `%` is an error. A blob is not a number, so `n + x'01'` is an error. A product keeps the decimal places of both operands and a sum or difference those of the operand with more, as in PostgreSQL (`1.00 * 3` is `3.00`); a product with more than 16383 decimal places is rounded to 16383. A remainder has the sign of the dividend (`-7.5 % 2` is `-1.5`). `-n` is a numeric with the same decimal places (`-n` is `-4.50` for `4.50`), and `coalesce(n, 0)` is a numeric. ORDER BY puts values that are not numbers, such as `'x'` from a UNION, after all numbers. As in PostgreSQL, a value may have at most 131072 digits before the decimal point and 16383 after; text such as `'1e100000000'` is an error (`value overflows numeric format`), whether it is stored, compared or used in arithmetic. |
+| `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
+| `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
+| `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
+| `macaddr` | text | -- | MAC address text. Stored as given; no validation yet. |
+| `macaddr8` | text | -- | MAC address text, allowing longer (8-byte) forms. Stored as given; no validation yet. |
+| `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
+| `json` | text | -- | Validated JSON text. |
+| `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
+
+Other operators on built-in types fail: `d * 2` on a `date` is `operator does not exist: date * integer`, and `-d` is `operator does not exist: - date`. `-n` on a `numeric` negates exactly, and `~`, `&`, `|`, `<<` and `>>` on a `numeric` fail, as in PostgreSQL. `smallint` and `bigint` use SQLite's operators, including `-`, `~`, `&`, `|`, `<<` and `>>`. Unary `+` gives its operand unchanged for every type.
+
+<Info>
+The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
+</Info>
+
+## Composite Types: STRUCT and UNION
+
+In addition to encode/decode custom types, CREATE TYPE supports two composite type forms: **STRUCT** (named product type) and **UNION** (discriminated union / tagged variant). Both store data as blobs on disk and require STRICT tables.
+
+### STRUCT
+
+A STRUCT groups multiple named fields into a single column. Use dot notation to read and filter on individual fields:
+
+```sql
+CREATE TYPE point AS STRUCT(x INT, y INT);
+
+CREATE TABLE locations (
+    id INTEGER PRIMARY KEY,
+    pos point
+) STRICT;
+
+INSERT INTO locations VALUES (1, struct_pack(10, 20));
+INSERT INTO locations VALUES (2, struct_pack(30, 40));
+
+-- Read fields with dot notation
+SELECT pos.x, pos.y FROM locations WHERE id = 1;
+-- 10|20
+
+-- Filter and order by fields
+SELECT id, pos.x FROM locations WHERE pos.y > 25 ORDER BY pos.x;
+-- 2|30
+```
+
+Dot notation works everywhere a column expression does — SELECT, WHERE, ORDER BY, GROUP BY, HAVING, and aggregate functions:
+
+```sql
+CREATE TYPE address AS STRUCT(street TEXT, city TEXT, zip TEXT);
+CREATE TABLE people(name TEXT, home address) STRICT;
+
+INSERT INTO people VALUES ('Alice', struct_pack('123 Main St', 'Springfield', '62704'));
+INSERT INTO people VALUES ('Bob', struct_pack('456 Oak Ave', 'Springfield', '62701'));
+
+SELECT home.city, COUNT(*) FROM people GROUP BY home.city;
+-- Springfield|2
+```
+
+When a table name and column name collide, table references always win. Use an alias to reach the struct field:
+
+```sql
+-- t.x here is table.column, not column.field
+SELECT t.x FROM t;
+
+-- Use an alias to access the struct field
+SELECT s.pos.x FROM locations AS s;
+```
+
+#### struct_pack()
+
+Creates a struct value for INSERT and UPDATE. Arguments are positional, matching the field order in the type definition.
+
+```sql
+INSERT INTO locations VALUES (1, struct_pack(10, 20));
+UPDATE locations SET pos = struct_pack(99, 88) WHERE id = 1;
+```
+
+#### struct_extract()
+
+Function form of dot notation — `struct_extract(col, 'field')` is equivalent to `col.field`. Primarily useful in expression indexes, where dot notation cannot be used:
+
+```sql
+CREATE INDEX idx_x ON locations(struct_extract(pos, 'x'));
+```
+
+### UNION
+
+A UNION is a discriminated union (tagged variant). Each value carries exactly one of the declared variants, identified by a tag. Use dot notation to extract a variant's value — it returns NULL when the active variant doesn't match:
+
+```sql
+CREATE TYPE platform_id AS UNION(telegram INT, slack TEXT, signal TEXT);
+
+CREATE TABLE contacts (
+    id INTEGER PRIMARY KEY,
+    platform platform_id
+) STRICT;
+
+INSERT INTO contacts VALUES (1, union_value('telegram', 12345));
+INSERT INTO contacts VALUES (2, union_value('slack', 'U0ABC'));
+INSERT INTO contacts VALUES (3, union_value('signal', '+1555'));
+
+-- Dot notation extracts the variant value (NULL if tag doesn't match)
+SELECT id, platform.telegram, platform.slack FROM contacts ORDER BY id;
+-- 1|12345|
+-- 2||U0ABC
+-- 3||
+
+-- Combine with union_tag() to filter by variant
+SELECT id, platform.slack FROM contacts WHERE union_tag(platform) = 'slack';
+-- 2|U0ABC
+```
+
+For unions whose variants are struct types, chain dot access to reach nested fields:
+
+```sql
+CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+CREATE TYPE msg AS UNION(telegram telegram_msg, slack TEXT);
+CREATE TABLE messages(id INT, data msg) STRICT;
+
+INSERT INTO messages VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+
+-- col.variant.field
+SELECT data.telegram.chat_id, data.telegram.text FROM messages;
+-- 100|hello
+```
+
+#### union_value()
+
+Creates a union value for INSERT and UPDATE. The first argument is the variant tag (a string literal), the second is the value. The tag is resolved against the target column's union type.
+
+```sql
+INSERT INTO contacts VALUES (1, union_value('telegram', 12345));
+UPDATE contacts SET platform = union_value('slack', 'U0XYZ') WHERE id = 1;
+```
+
+#### union_tag()
+
+Returns the tag name of the active variant as text.
+
+```sql
+SELECT id, union_tag(platform) FROM contacts ORDER BY id;
+-- 1|telegram
+-- 2|slack
+-- 3|signal
+```
+
+#### union_extract()
+
+Function form of dot notation — `union_extract(col, 'variant')` is equivalent to `col.variant`. Primarily useful in expression indexes:
+
+```sql
+CREATE INDEX idx_tg ON contacts(union_extract(platform, 'telegram'));
+```
+
+### NULL handling
+
+NULL values propagate through all struct and union operations:
+
+```sql
+CREATE TYPE number AS UNION(i INT, f REAL);
+CREATE TABLE values_t(id INT, val number) STRICT;
+
+INSERT INTO values_t VALUES (1, union_value('i', 42));
+INSERT INTO values_t VALUES (2, union_value('f', 3.14));
+INSERT INTO values_t VALUES (3, NULL);
+
+SELECT id, val.i, val.f FROM values_t ORDER BY id;
+-- 1|42|
+-- 2||3.14
+-- 3||
+```
+
+### Dot notation precedence
+
+When a dot expression `a.b` is ambiguous (e.g., `a` could be a table name or a column name), table references always take priority over struct field access. This follows DuckDB's resolution rules.
+
+```sql
+CREATE TYPE point AS STRUCT(x INT, y INT);
+CREATE TABLE t(x INT, t point) STRICT;
+INSERT INTO t VALUES (99, struct_pack(10, 20));
+
+-- t.x resolves as table.column (99), not column.field (10)
+SELECT t.x FROM t;
+-- 99
+
+-- Use an alias to reach the struct field
+SELECT s.t.x FROM t AS s;
+-- 10
+```
+
+For `a.b.c`, the resolution order is: database.table.column, then table.column.field.
+
+### Inline types not supported
+
+Inline STRUCT/UNION declarations in column definitions are not supported. Always use CREATE TYPE first:
+
+```sql
+-- This will error:
+CREATE TABLE t(data STRUCT(x INT, y INT)) STRICT;
+
+-- Do this instead:
+CREATE TYPE point AS STRUCT(x INT, y INT);
+CREATE TABLE t(data point) STRICT;
+```
+
+## Array Types
+
+Array columns store ordered collections of values. Unlike STRUCT and UNION, arrays don't require an explicit CREATE TYPE — declare them by appending `[]` to any base type name in a STRICT table column definition:
+
+```sql
+CREATE TABLE sensors (
+    id INTEGER PRIMARY KEY,
+    readings REAL[],
+    labels TEXT[],
+    flags INTEGER[]
+) STRICT;
+
+INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], ARRAY['temp','humidity'], '[0, 1, 1]');
+
+SELECT readings[0], labels[1], array_length(flags) FROM sensors;
+-- 1.5|humidity|3
+```
+
+Multi-dimensional arrays use multiple bracket pairs:
+
+```sql
+CREATE TABLE matrices (
+    id INTEGER PRIMARY KEY,
+    data INTEGER[][]
+) STRICT;
+
+INSERT INTO matrices VALUES (1, ARRAY[ARRAY[1,2], ARRAY[3,4]]);
+SELECT data[1][0] FROM matrices;
+-- 3
+```
+
+Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
+
+For the full set of array functions (`array_agg`, `array_append`, `array_contains`, `array_slice`, etc.), operators (`@>`, `&&`, `||`), and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
+
+## Restrictions
+
+- **STRICT tables only**: Custom type names are ignored in non-STRICT tables. The column uses standard type affinity rules instead.
+- **Cannot drop while in use**: A type cannot be dropped with DROP TYPE while any table has a column of that type.
+
+<Note>
+If a non-STRICT table was created with a type name that did not exist at the time (e.g., `CREATE TABLE t(x mytype)`), and a custom type with that name is created afterwards (`CREATE TYPE mytype ...`), the type's ENCODE/DECODE logic will **not** be retroactively applied to the existing table. This is not a bug: non-STRICT tables treat all type names as plain affinity hints regardless of whether a matching custom type exists. STRICT tables prevent this scenario because they reject unknown type names at CREATE TABLE time.
+</Note>
+- **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
+- **No indexes on STRUCT/UNION columns**: CREATE INDEX on a STRUCT or UNION column is not supported.
+
+## Examples
+
+### Identity Type (Passthrough)
+
+A minimal type that stores and retrieves values without transformation:
+
+```sql
+CREATE TYPE my_text BASE text ENCODE value DECODE value;
+
+CREATE TABLE notes (
+    id INTEGER PRIMARY KEY,
+    body my_text
+) STRICT;
+```
+
+### Monetary Values as Cents
+
+Store dollar amounts as integer cents, and present them as the original value:
+
+```sql
+CREATE TYPE cents BASE integer
+    ENCODE value * 100
+    DECODE value / 100;
+
+CREATE TABLE invoices (
+    id INTEGER PRIMARY KEY,
+    amount cents
+) STRICT;
+
+INSERT INTO invoices VALUES (1, 42);
+-- Stored as 4200 on disk, queried as 42
+
+SELECT amount FROM invoices;
+-- 42
+```
+
+### JSON Validation
+
+Validate that inserted values are valid JSON:
+
+```sql
+CREATE TYPE json BASE text
+    ENCODE json(value)
+    DECODE value;
+
+CREATE TABLE configs (
+    id INTEGER PRIMARY KEY,
+    data json
+) STRICT;
+
+INSERT INTO configs VALUES (1, '{"key": "value"}');
+-- succeeds
+
+INSERT INTO configs VALUES (2, 'not json');
+-- Error: malformed JSON
+```
+
+### Unsigned Integer
+
+A non-negative integer type. The stored value is the integer itself, so it sorts in the same order and the type can declare `OPERATOR '<'`:
+
+```sql
+CREATE TYPE uint BASE integer
+    ENCODE CASE
+        WHEN value >= 0 THEN value
+        ELSE RAISE(ABORT, 'uint must be non-negative')
+    END
+    DECODE value
+    OPERATOR '<';
+
+CREATE TABLE counters (
+    id INTEGER PRIMARY KEY,
+    count uint DEFAULT 0
+) STRICT;
+
+INSERT INTO counters VALUES (1, 5);
+SELECT * FROM counters WHERE count > 0 ORDER BY count;
+```
+
+### Fixed-Point Decimal
+
+Use the built-in `numeric` type for precise decimal arithmetic:
+
+```sql
+CREATE TABLE transactions (
+    id INTEGER PRIMARY KEY,
+    amount numeric(10, 2),
+    tax numeric(10, 2)
+) STRICT;
+
+INSERT INTO transactions VALUES (1, 99.99, 8.25);
+SELECT amount + tax FROM transactions;
+-- 108.24
+```
+
+## See Also
+
+- [DROP TYPE](/docs/sql-reference/statements/drop-type) for removing custom types
+- [CREATE DOMAIN](/docs/sql-reference/statements/create-domain) for defining constrained type aliases without ENCODE/DECODE logic
+- [Data Types](/docs/sql-reference/data-types) for an overview of the type system and type affinity
+- [Array Types](/docs/sql-reference/data-types#array-types) for native array columns (`INTEGER[]`, `TEXT[]`, etc.)
+- [Array Functions](/docs/sql-reference/functions/array) for array construction, manipulation, and operators
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for STRICT table definitions

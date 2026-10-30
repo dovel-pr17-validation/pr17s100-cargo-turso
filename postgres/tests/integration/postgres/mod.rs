@@ -1,0 +1,11 @@
+mod catalog;
+mod copy;
+mod dialect;
+mod domain;
+mod functions;
+mod namespace;
+mod parse_edge_cases;
+mod sequence;
+mod table;
+mod type_aliases;
+mod update_from;
